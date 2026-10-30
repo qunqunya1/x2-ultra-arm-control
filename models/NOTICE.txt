@@ -1,0 +1,11 @@
+Derived candidate from AgibotTech/agibot_x2_urdf (Mulan PSL v2). Modified locally: old-X2 arm plus donor 1.4 wrist/tool, frozen gripper, adjusted collision geometry. NOT an official old-X2 OmniPicker model.
+
+Upstream: https://github.com/AgibotTech/agibot_x2_urdf
+OmniPicker donor: X2_URDF-v1.4.0/X2-Ultra_omnipicker.urdf
+Donor commit: 575cc6b988f976c23550e0db85aa1e5475d3652d
+Arm source: vendor X2_URDF-v1.3.0; arm joints retained.
+Sharing-copy modification: all visual/collision geometry removed.
+Joint, frame and inertial parameters are unchanged from the local derived model.
+Gripper joints are fixed at the nominal vendor pose for dynamics.
+Terminal inertia is nominal and has not been identified on hardware.
+The real grippers are controlled separately through the HAL hand interface.

@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>X2 · 双臂调试台</title><link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script></head>
+<body>
+<header><div class="brand"><span class="logo">X2</span><div><b>双臂调试台</b><small>ULTRA / OMNIPICKER</small></div></div><div class="header-right"><span id="mode" class="pill">连接中</span><span id="connection" class="pill neutral">等待后端</span></div></header>
+<main><div class="intro"><div><div class="eyebrow">ROBOT WORKSPACE</div><h1>关节控制与末端力</h1><p>在一个工作台中观察双臂，调整关节目标。</p></div><div class="endpoint"><span class="dot"></span> 本地连接 <code id="endpoint"></code></div></div>
+<section class="toolbar"><div><span class="label">控制状态</span><strong id="control-state">等待反馈</strong><span id="limit-note">目标经过速度与加速度限制</span></div><div class="actions"><button id="sync">对齐当前角度</button><button id="arm" class="primary" disabled>启动实机控制</button><button id="hold" class="hold" disabled>保持当前姿态</button></div></section>
+<details id="readiness" class="readiness"><summary id="readiness-title">启动条件检查</summary><ul id="startup-checks"></ul></details>
+<div id="notice" class="notice">正在连接后端。数据缺失时显示 —，不会填入零值。</div>
+<section class="gripper-panel"><div class="section-title"><h2>夹爪开合</h2><span>0% 全闭 · 100% 全开</span></div><div id="grippers" class="gripper-grid"></div><p id="gripper-note" class="gripper-note">拖动预览后点击“发送目标”；开启实时下发后，拖动直接控制对应夹爪。</p></section>
+<div class="workspace"><section class="joint-space"><div class="section-title"><h2>双臂关节</h2><span>滑块目标 · °</span></div><div id="arms" class="arm-grid"></div></section>
+<aside><div class="section-title"><h2>法兰六维力</h2><span>N / N·m</span></div><div class="force-note">各臂法兰局部坐标 · 力估计值</div><div id="forces"></div><div class="explain"><b>如何读取这些数值</b><p>有效性结合时间戳、姿态可观测性和标定状态判断。灰色曲线表示诊断预览或数据过期。</p><p>保持按钮请求位置保持，仍会输出关节指令，不是硬件急停。</p></div></aside></div>
+<footer><span id="feedback-age">关节消息 —</span><span id="display-age">角度显示年龄 —</span><span id="force-age">估计更新 —</span><span id="command-count">电机指令 0</span><span>SSH 转发 · 仅本地访问</span></footer>
+</main><div id="toast" role="status"></div></body></html>

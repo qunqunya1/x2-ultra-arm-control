@@ -1,0 +1,8 @@
+{
+  "name": "X2 Ultra + OmniPicker (dynamics only)",
+  "dynamics_urdf": "models/x2_ultra_omnipicker_dynamics.urdf",
+  "flange_sensor_config": "configs/virtual_flange_sensor.json",
+  "terminal_inertia_identified": false,
+  "grasp_tcp_calibrated": false,
+  "finger_pose": "vendor zero-angle fixed snapshot"
+}

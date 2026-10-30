@@ -1,0 +1,76 @@
+{
+  "target_robot_release": "1.1.5",
+  "actual_onboard_sdk_verified": false,
+  "arm_state_topic": "/aima/hal/joint/arm/state",
+  "waist_state_topic": "/aima/hal/joint/waist/state",
+  "arm_command_topic": "/aima/hal/joint/arm/command",
+  "output_namespace": "/x2/control",
+  "command_hz": 250.0,
+  "window_s": 0.01,
+  "max_sample_gap_s": 0.01,
+  "source_max_age_s": 0.05,
+  "feedback_timeout_s": 0.05,
+  "waist_timeout_s": 0.1,
+  "max_waist_velocity_rad_s": 0.03,
+  "max_waist_change_rad": 0.002,
+  "base_gravity_m_s2": [
+    0,
+    0,
+    -9.81
+  ],
+  "base_assumption": "supported quasi-static pelvis; IMU gravity correction; base/waist acceleration dynamics not modeled",
+  "base_assumption_confirmed": false,
+  "effort_feedback_semantics_confirmed": false,
+  "control_ownership_confirmed": false,
+  "gravity_scale": 1.0,
+  "gravity_ramp_s": 2.0,
+  "joint_kp": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "joint_kd": [
+    0.5,
+    0.5,
+    0.4,
+    0.4,
+    0.2,
+    0.15,
+    0.15
+  ],
+  "exit_hold_kp": [
+    15,
+    15,
+    10,
+    10,
+    5,
+    3,
+    3
+  ],
+  "exit_hold_kd": [
+    2,
+    2,
+    1.5,
+    1.5,
+    0.8,
+    0.5,
+    0.5
+  ],
+  "exit_hold_duration_s": 0.4,
+  "max_joint_velocity_rad_s": 1.0,
+  "max_drift_from_start_rad": 0.3,
+  "max_extra_torque_Nm": [
+    12,
+    12,
+    8,
+    8,
+    4,
+    3,
+    3
+  ],
+  "flange_config": "configs/virtual_flange_sensor.json"
+}

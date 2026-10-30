@@ -1,0 +1,10 @@
+name: x2-control
+channels:
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.10
+  - pinocchio=4.1.0
+  - numpy=2.2.6
+  - scipy=1.15.2
+# Robot backend additionally uses the matching vendor ROS2/SDK environment.
