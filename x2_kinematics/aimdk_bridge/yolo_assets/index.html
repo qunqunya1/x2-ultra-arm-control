@@ -1,0 +1,9 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>X2 · YOLO 视觉调试</title><link rel="stylesheet" href="/styles.css"><script src="/app.js" defer></script></head><body><main>
+<header><div><small>X2 / COMPUTER VISION</small><h1>插头插座 · YOLO 实时检测</h1><p>读取机器人 RGB，在电脑推理；本页不发送任何机器人控制指令。</p></div><a href="http://127.0.0.1:8765/" target="_blank" rel="noopener">机器人控制网页 ↗</a></header>
+<section class="toolbar"><div><strong id="phase">正在连接服务</strong><p id="model">正在读取模型信息</p></div><div class="actions"><label>置信度 <input id="conf" type="range" min="0.05" max="0.95" step="0.05" value="0.25"><span id="conf-value">0.25</span></label><label><input id="masks" type="checkbox" checked>显示分割掩码</label><button id="toggle" disabled>开始检测</button><button id="save" disabled>保存当前检测结果</button></div></section>
+<div id="notice">请先在机器人控制网页中开启相机预览，再点击开始检测。</div>
+<section class="images"><article><div class="image"><img id="raw" alt="用于这次检测的原始 RGB 图像" hidden><span>等待 RGB 输入</span></div><h2>对应原始 RGB <small id="source-frame">—</small></h2></article><article><div class="image"><img id="annotated" alt="同帧 YOLO 检测框和分割掩码" hidden><span>等待检测结果</span></div><h2>检测与实例分割 <small id="age">—</small></h2></article></section>
+<section class="stats"><div>推理设备<strong id="device">—</strong></div><div>模型推理耗时<strong id="inference">—</strong></div><div>取帧至结果<strong id="latency">—</strong></div><div>本帧目标数量<strong id="count">—</strong></div></section>
+<section class="results"><h2>当前检测目标</h2><table><thead><tr><th>类别</th><th>置信度</th><th>边界框 xyxy / 像素</th><th>分割轮廓</th></tr></thead><tbody id="detections"><tr><td colspan="4">等待检测</td></tr></tbody></table><p id="saved"></p></section>
+<footer>原图和检测图属于同一帧；处理繁忙时跳过中间帧，避免排队积累。此处仅输出图像中的二维位置，不代表抓取位姿或已完成机器人定位标定。</footer>
+</main></body></html>

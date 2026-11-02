@@ -7,4 +7,5 @@ dependencies:
   - pinocchio=4.1.0
   - numpy=2.2.6
   - scipy=1.15.2
+  - pillow>=10
 # Robot backend additionally uses the matching vendor ROS2/SDK environment.

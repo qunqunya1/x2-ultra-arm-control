@@ -27,7 +27,22 @@ class JointPlan:
     extra: np.ndarray
 
 
+def validated_joint_gains(config, kp, kd):
+    result = []
+    for value, key, default in ((kp, "kp", 200.), (kd, "kd", 20.)):
+        if np.asarray(value).dtype.kind not in "fiu" or any(isinstance(x,(bool,np.bool_)) for x in np.asarray(value,dtype=object).flat):
+            raise ValueError("Joint gains must be numeric arrays")
+        gains = repeated(value, key)
+        limit = repeated(config.get("panel_joint_"+key+"_max", [default]*7), key+"_max")
+        if np.any(gains > limit):
+            raise ValueError("Joint "+key+" exceeds the configured tuning range")
+        result.append(gains)
+    return tuple(result)
+
+
 class JointPanelControl:
+    mode = "joint"
+
     def __init__(self, dynamics, config):
         for key in ("actual_onboard_sdk_verified", "base_assumption_confirmed",
                     "effort_feedback_semantics_confirmed"):
@@ -36,10 +51,11 @@ class JointPanelControl:
         self.model, self.cfg = dynamics, dict(config)
         self.recovery_margin=recovery_margins(config)
         self.recovery_lower=self.recovery_upper=None
-        self.kp = repeated(config["panel_joint_kp"], "panel_joint_kp")
-        self.kd = repeated(config["panel_joint_kd"], "panel_joint_kd")
-        if np.any(self.kp <= 0):
-            raise ValueError("Position control requires positive stiffness")
+        self.kp, self.kd = validated_joint_gains(config, config["panel_joint_kp"], config["panel_joint_kd"])
+        self.kp_target, self.kd_target = self.kp.copy(), self.kd.copy()
+        self.gain_rates = np.asarray([config.get("panel_kp_slew_per_s", 80.), config.get("panel_kd_slew_per_s", 8.)], float)
+        if not np.isfinite(self.gain_rates).all() or np.any(self.gain_rates <= 0):
+            raise ValueError("Gain slew rates must be positive and finite")
         self.vmax = float(config["panel_max_velocity_rad_s"])
         self.amax = float(config["panel_max_acceleration_rad_s2"])
         self.timeout = float(config["panel_lease_timeout_s"])
@@ -62,6 +78,10 @@ class JointPanelControl:
 
     def feedback(self, sample, gravity):
         self.sample, self.gravity = sample, np.asarray(gravity, float).copy()
+
+    def update_gains(self, kp, kd):
+        kp, kd = validated_joint_gains(self.cfg, kp, kd)
+        self.kp_target, self.kd_target = kp, kd
 
     def _fresh(self, now_ns, ros_now_ns):
         if self.sample is None:
@@ -128,6 +148,9 @@ class JointPanelControl:
             dt = (now_ns-self.last_command_ns)*1e-9
             if not 0 <= dt <= self.cfg["feedback_timeout_s"]:
                 raise ValueError("Control loop stalled")
+            if self.fault is None:
+                self.kp += np.clip(self.kp_target-self.kp, -self.gain_rates[0]*dt, self.gain_rates[0]*dt)
+                self.kd += np.clip(self.kd_target-self.kd, -self.gain_rates[1]*dt, self.gain_rates[1]*dt)
             if np.max(np.abs(self.position-self.sample.q)) > self.tracking_limit:
                 raise ValueError("Joint tracking error exceeded")
             if self.state == "armed":

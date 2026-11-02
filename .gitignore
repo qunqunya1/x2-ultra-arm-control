@@ -5,3 +5,10 @@ __pycache__/
 logs/
 *.log
 *.jsonl
+captures/
+reports/
+*.pt
+*.pth
+*.onnx
+*.npz
+*.mp4

@@ -13,12 +13,16 @@ from types import SimpleNamespace as Obj
 import numpy as np
 
 from .dynamics import LiveWaistArmDynamics
-from .joint_panel_control import JointPanelControl, admissible_start, recovery_margins
+from .joint_panel_control import JointPanelControl, admissible_start, recovery_margins, validated_joint_gains
+from .cartesian_panel_control import CartesianPanelControl, validated_task_gains
+from .cartesian_pose import flange_pose_snapshot
+from .runtime import repeated
 from .serialization import diagnostic_json
 from .protocol import ARM_NAMES, WAIST_NAMES, decode_arm, build_command, verify_sdk_types, ordered_joints, stamp_ns
 from .runtime import ArmRuntime
 from .base_monitor import StaticBaseImu
 from .gripper import GripperFeedback,build_gripper_command,normalized
+from .camera_stream import CameraWorker
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSETS = Path(__file__).with_name("panel_assets")
@@ -39,6 +43,7 @@ class PanelStore:
         self.last_gripper_seq={}
         self.updated_ns = time.monotonic_ns()
         self.signals = {}
+        self.camera = None
 
     def note_signal(self, key, value):
         with self.lock:
@@ -51,6 +56,14 @@ class PanelStore:
             now=time.monotonic_ns()
             signals={key:(max(0.,(now-stamp)*1e-6),dict(payload)) for key,(stamp,payload) in self.signals.items()}
         value["ui_snapshot_age_ms"]=elapsed_ms
+        if value.get('cartesian_pose') is not None:
+            pose=dict(value['cartesian_pose'])
+            for key in ('age_ms','source_age_ms'):
+                if pose.get(key) is not None:pose[key]+=elapsed_ms
+            pose['fresh']=bool(pose.get('fresh') and pose.get('age_ms') is not None and
+                0 <= pose['age_ms'] <= pose['timeout_ms'] and
+                pose.get('source_age_ms') is not None and -10 <= pose['source_age_ms'] <= pose['timeout_ms'])
+            value['cartesian_pose']=pose
         for key in ("feedback_age_ms", "wrench_age_ms"):
             if value.get(key) is not None:
                 value[key] += elapsed_ms
@@ -63,14 +76,16 @@ class PanelStore:
         if value.get("base_imu") is not None:
             base=dict(value["base_imu"])
             base_lag=elapsed_ms
+            base_ready=False
             if 'base_imu' in signals:
                 base_lag,base=signals['base_imu']
             if base.get("age_ms") is not None:
                 base["age_ms"]+=base_lag
                 if base.get('source_age_ms') is not None:base['source_age_ms']+=base_lag
                 if base["age_ms"] > value.get("base_imu_timeout_ms",100) or (base.get('source_age_ms') is not None and not -10 <= base['source_age_ms'] <= value.get('base_imu_timeout_ms',100)):
-                    base.update(ready=False,reason="胯部 IMU 反馈过期")
-                if not base.get('ready'):
+                    base.update(ready=False,tracking_valid=False,reason="胯部 IMU 反馈过期")
+                base_ready=base.get('tracking_valid',base.get('ready')) if value.get('control_state')=='armed' else base.get('ready')
+                if not base_ready:
                     value["can_arm"]=False
                     value["startup_checks"]=[dict(c,ok=False) if c["key"]=="base_imu" else dict(c) for c in value.get("startup_checks",[])]
                     if "quality" in value:
@@ -78,7 +93,7 @@ class PanelStore:
                             reasons=list(value["quality"].get("reasons",[]))+["base_imu_not_ready"])
             value["base_imu"]=base
             if 'base_imu' in signals:
-                value['startup_checks']=[dict(c,ok=bool(base.get('ready'))) if c['key']=='base_imu' else dict(c) for c in value.get('startup_checks',[])]
+                value['startup_checks']=[dict(c,ok=bool(base_ready)) if c['key']=='base_imu' else dict(c) for c in value.get('startup_checks',[])]
         if value.get("waist_feedback") is not None:
             waist=dict(value["waist_feedback"])
             for key in ("age_ms","source_age_ms"):
@@ -147,37 +162,39 @@ class PanelStore:
         if op == "start_control":
             op = "arm"
             message = dict(message, op=op)
-        if op not in ("arm", "targets", "heartbeat", "hold","gripper_target") or not isinstance(client, str) or not 1 <= len(client) <= 80:
+        setup_ops = ("arm", "gripper_target", "joint_gains", "cartesian_gains", "control_mode")
+        if op not in (*setup_ops, "targets", "cartesian_targets", "cartesian_rebase", "drag_mode", "heartbeat", "hold") or not isinstance(client, str) or not 1 <= len(client) <= 80:
             raise ValueError("Invalid command")
         with self.lock:
             if self.owner is not None and self.owner != client:
                 raise ValueError("另一个网页持有控制权")
-            if op not in ("arm","gripper_target") and self.owner != client:
+            if op not in setup_ops and self.owner != client:
                 raise ValueError("请先从当前角度接管")
             if op=='gripper_target':
                 side=message.get('side');normalized(message.get('opening'))
+                if 'effort' in message:normalized(message['effort'])
                 seq=message.get('sequence')
                 if side not in ('left','right'):raise ValueError('未知夹爪')
                 if isinstance(seq,bool) or not isinstance(seq,int) or seq<=self.last_gripper_seq.get(client,-1):raise ValueError('过期的夹爪目标')
                 self.last_gripper_seq[client]=seq
                 self.pending=deque(x for x in self.pending if not(x['op']=='gripper_target' and x['side']==side))
-            if op == "targets":
+            if op in ("targets", "cartesian_targets"):
                 q, seq = message.get("q_rad"), message.get("sequence")
-                if (not isinstance(q, list) or len(q) != 14 or
+                if op == "targets" and (not isinstance(q, list) or len(q) != 14 or
                     any(isinstance(x, bool) or not isinstance(x, (int, float)) or not np.isfinite(x) for x in q)):
                     raise ValueError("Target requires fourteen finite radians")
                 if not isinstance(seq, int) or isinstance(seq, bool) or seq <= self.last_seq.get(client, -1):
                     raise ValueError("过期的滑块指令")
                 self.last_seq[client] = seq
                 # Replace pending target updates; never accumulate a motion queue.
-                self.pending = deque(x for x in self.pending if x["op"] != "targets")
+                self.pending = deque(x for x in self.pending if x["op"] != op)
             if op == "hold":
                 self.pending.clear()
             if op != "heartbeat":
                 if len(self.pending) >= 8:
                     raise ValueError("Command queue full")
                 self.pending.append(dict(message))
-            if op!='gripper_target':self.contact_ns = int(now_ns)
+            if op not in setup_ops or op == 'arm':self.contact_ns = int(now_ns)
 
     def drain(self):
         with self.lock:
@@ -200,16 +217,17 @@ def make_server(store, port):
         def log_message(self, *args):
             pass
 
-        def reply(self, status, body, content_type="application/json; charset=utf-8"):
+        def reply(self, status, body, content_type="application/json; charset=utf-8", download_name=None):
             if not isinstance(body, bytes):
                 body = diagnostic_json(body).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            if download_name is not None:self.send_header('Content-Disposition',f'attachment; filename="{download_name}"')
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
+            self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' blob:; frame-ancestors 'none'; base-uri 'none'")
             self.end_headers()
             try:
                 self.wfile.write(body)
@@ -228,8 +246,23 @@ def make_server(store, port):
                 return self.reply(200, dict(token=store.token))
             if self.path == "/api/state":
                 return self.reply(200, store.read())
+            if self.path.startswith('/api/camera/'):
+                if store.camera is None:return self.reply(503,dict(error='相机功能未启用',running=False))
+                try:
+                    if self.path=='/api/camera/state':return self.reply(200,store.camera.state())
+                    if self.path.startswith('/api/camera/frame/'):
+                        data,mime=store.camera.request('/frame/'+self.path.removeprefix('/api/camera/frame/'))
+                        return self.reply(200,data,mime)
+                    if self.path.startswith('/api/camera/files/'):
+                        name=self.path.removeprefix('/api/camera/files/')
+                        data,mime=store.camera.download(name)
+                        return self.reply(200,data,mime,download_name=name)
+                    return self.reply(404,dict(error='Not found'))
+                except ValueError as error:return self.reply(409,dict(error=str(error)))
+                except OSError:return self.reply(503,dict(error='相机文件读取失败'))
             assets = {"/": ("index.html", "text/html; charset=utf-8"),
                       "/app.js": ("app.js", "text/javascript; charset=utf-8"),
+                      "/camera.js": ("camera.js", "text/javascript; charset=utf-8"),
                       "/styles.css": ("styles.css", "text/css; charset=utf-8")}
             if self.path not in assets:
                 return self.reply(404, dict(error="Not found"))
@@ -240,7 +273,7 @@ def make_server(store, port):
             if (not self.allowed_host() or self.headers.get("Origin") != "http://"+self.headers.get("Host", "") or
                     not secrets.compare_digest(self.headers.get("X-Panel-Token", ""), store.token)):
                 return self.reply(403, dict(error="Invalid local session"))
-            if self.path != "/api/command":
+            if self.path not in ('/api/command','/api/camera/preview','/api/camera/capture'):
                 return self.reply(404, dict(error="Not found"))
             try:
                 if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
@@ -251,6 +284,15 @@ def make_server(store, port):
                 request = json.loads(self.rfile.read(length))
                 if not isinstance(request, dict):
                     raise ValueError("Object required")
+                if self.path.startswith('/api/camera/'):
+                    if store.camera is None:raise ValueError('相机功能未启用')
+                    if self.path=='/api/camera/preview':
+                        if not isinstance(request.get('enabled'),bool):raise ValueError('Invalid preview switch')
+                        if request['enabled']:store.camera.start()
+                        else:store.camera.close()
+                        return self.reply(200,store.camera.state())
+                    data,mime=store.camera.request('/capture',dict(frame_id=request.get('frame_id')))
+                    return self.reply(200,data,mime)
                 store.submit(request, time.monotonic_ns())
                 self.reply(202, dict(accepted=True))
             except (ValueError, TypeError) as error:
@@ -274,13 +316,22 @@ class PanelEngine:
         self.timing_cache={};self.last_timing_snapshot_ns=0
         observer_cfg = dict(cfg, max_drift_from_start_rad=2*np.pi,
                             window_s=cfg["panel_wrench_window_s"], max_sample_gap_s=cfg["panel_wrench_max_gap_s"])
-        self.observer = ArmRuntime(self.model, observer_cfg, flange, mode="observe")
+        self.waist_motion_guard_enabled=cfg.get('panel_waist_motion_guard_enabled',True)
+        self.observer = ArmRuntime(self.model, observer_cfg, flange, mode="observe",
+            waist_motion_guard_enabled=self.waist_motion_guard_enabled)
         if mode not in ("observe", "web", "control"):
             raise ValueError("Invalid panel mode")
         # Both web and legacy control modes start with subscriptions only.
         self.control_enabled = mode != "observe"
         self.static_startup_checks=None
         self.control = None
+        self.selected_control_mode = 'joint'
+        self.parameter_revision = 0
+        self.cfg['panel_joint_kp'],self.cfg['panel_joint_kd'] = [v.tolist() for v in
+            validated_joint_gains(self.cfg,self.cfg['panel_joint_kp'],self.cfg['panel_joint_kd'])]
+        self.cfg['panel_cartesian_stiffness'],self.cfg['panel_cartesian_damping'] = [v.tolist() for v in
+            validated_task_gains(self.cfg,self.cfg.get('panel_cartesian_stiffness',[150,150,150,2,2,2]),
+                                self.cfg.get('panel_cartesian_damping',[12,12,12,.25,.25,.25]))]
         self.base_monitor = None
         if backend == "robot" and cfg.get("panel_base_imu_required"):
             if cfg["panel_base_imu_topic"] != "/aima/hal/imu/torso/state":
@@ -293,6 +344,8 @@ class PanelEngine:
         self.plans_sent = 0
         self.action_error = None
         self.sample = self.gravity = self.wrench = None
+        self.pose_sample = None
+        self.pose_error = None
         self.error = self.arm_blocked = None
         self.last_source_ns = None
         self.last_snapshot_ns = 0
@@ -306,6 +359,8 @@ class PanelEngine:
         self.gripper_commands_sent=0
         self.gripper_hardware_publisher_created=False
         self.gripper_requests_generated=0
+        self.gripper_drives={side:dict(cfg.get('panel_gripper_drive',dict(velocity=.2,acceleration=.2,deceleration=.2,effort=.2)))
+                             for side in ('left','right')}
         self.waist_observation = None
         self.waist_reference = None
         self.waist_stable_since = None
@@ -336,7 +391,7 @@ class PanelEngine:
             self.observer._age(source,ros_now_ns,self.cfg["source_max_age_s"])
             observed["valid"]=True
             previous=self.observer.waist
-            if self.control is not None and self.control.state=='armed' and previous is not None:
+            if self.waist_motion_guard_enabled and self.control is not None and self.control.state=='armed' and previous is not None:
                 interval=max(0.,(source-previous[2])*1e-9)
                 allowance=self.cfg['max_waist_change_rad']+self.cfg['max_waist_velocity_rad_s']*interval
                 if np.max(np.abs(q-previous[0])) > allowance:
@@ -374,11 +429,13 @@ class PanelEngine:
         fresh=bool(0 <= age <= self.cfg["waist_timeout_s"] and source_age is not None and
                    -.01 <= source_age <= self.cfg["source_max_age_s"])
         stable=0. if self.waist_stable_since is None else max(0.,(now_ns-self.waist_stable_since)*1e-9)
-        stationary=bool(observed["valid"] and fresh and observed["model_valid"] and stable >= self.waist_settle_s)
+        stationary=bool(observed["valid"] and fresh and observed["model_valid"] and
+            (not self.waist_motion_guard_enabled or stable >= self.waist_settle_s))
         reason=observed["reason"]
         if reason is None and not fresh:reason="waist_feedback_missing_or_stale"
         if reason is None and not stationary:reason="waist_settling"
-        return dict(valid=observed["valid"],fresh=fresh,stationary=stationary,age_ms=age*1000,
+        return dict(valid=observed["valid"],fresh=fresh,stationary=stationary,
+                    motion_guard_enabled=self.waist_motion_guard_enabled,age_ms=age*1000,
                     source_age_ms=None if source_age is None else source_age*1000,
                     reason=reason,q_rad=observed["q_rad"],dq_rad_s=observed["dq_rad_s"],stable_s=stable)
 
@@ -392,6 +449,8 @@ class PanelEngine:
                 self.observer.estimator.reset()
                 self.wrench_epoch+=1
                 self.wrench=None
+                if self.control is not None and self.control.state=='armed':
+                    self.control.fail(self.base_monitor.reason)
             processing=time.monotonic_ns()-began
             self.store.note_signal('base_imu',self.base_monitor.status(now_ns+processing,ros_now_ns+processing))
 
@@ -402,12 +461,24 @@ class PanelEngine:
         began=time.monotonic_ns()
         if self.last_arm_callback_ns is not None:self.timing['arm_gap_ms'].append((began-self.last_arm_callback_ns)*1e-6)
         self.last_arm_callback_ns=began
+        # Geometric telemetry stays live even when the dynamics observer is
+        # waiting for a stationary waist or has rejected a force window.
+        try:
+            sample=decode_arm(msg,now_ns)
+            self.observer._age(sample.source_ns,ros_now_ns,self.cfg['source_max_age_s'])
+            if self.pose_sample is not None and sample.source_ns <= self.pose_sample.source_ns:
+                raise ValueError('nonmonotonic_arm_source_timestamp')
+            self.pose_sample=sample
+            self.pose_error=None
+        except ValueError as error:
+            self.pose_error=str(error)
+            self.invalid(error)
+            return
         if self.observer.waist is None:
             return
         if self.waist_observation is not None and not self.waist_observation["model_valid"]:
             return  # Do not clear the waist error or estimate with an old pose.
         try:
-            sample = decode_arm(msg, now_ns)
             if self.last_source_ns is not None and sample.source_ns <= self.last_source_ns:
                 raise ValueError("nonmonotonic_arm_source_timestamp")
             try:
@@ -446,14 +517,38 @@ class PanelEngine:
             try:
                 if not self.control_enabled:
                     raise ValueError("Observe mode")
+                current_owner,_=self.store.lease()
+                if current_owner is not None and current_owner != message['client_id']:
+                    raise ValueError('另一个网页持有控制权')
                 op = message["op"]
                 if op=='gripper_target':
                     opening=self.grippers.require(message['side'],message['opening'],now_ns,ros_now_ns)
                     if self.gripper_transport is None:raise ValueError('夹爪控制接口尚未就绪')
-                    self.gripper_transport(message['side'],opening,ros_now_ns)
+                    drive=dict(self.gripper_drives[message['side']])
+                    if 'effort' in message:drive['effort']=normalized(message['effort'])
+                    self.gripper_transport(message['side'],opening,ros_now_ns,dict(drive))
+                    self.gripper_drives[message['side']]=drive
                     self.gripper_last_targets[message['side']]=opening
                     self.gripper_requests_generated+=1
                     self.gripper_error=None
+                elif op == 'control_mode':
+                    choice=message.get('control_mode')
+                    if choice not in ('joint','cartesian'):raise ValueError('未知控制模式')
+                    if self.control is not None and self.control.state=='armed':
+                        raise ValueError('请先点击保持，再切换控制模式')
+                    if choice=='cartesian' and self.backend=='robot' and not self.cfg.get('panel_cartesian_robot_enabled',False):
+                        raise ValueError('笛卡尔阻抗目前仅开放本地演示，尚未启用实机')
+                    self.selected_control_mode=choice
+                elif op == 'joint_gains':
+                    kp,kd=validated_joint_gains(self.cfg,message.get('kp'),message.get('kd'))
+                    if self.control is not None and self.control.mode=='joint':self.control.update_gains(kp,kd)
+                    self.cfg['panel_joint_kp'],self.cfg['panel_joint_kd']=kp.tolist(),kd.tolist()
+                    self.parameter_revision+=1
+                elif op == 'cartesian_gains':
+                    k,d=validated_task_gains(self.cfg,message.get('stiffness'),message.get('damping'))
+                    if self.control is not None and self.control.mode=='cartesian':self.control.update_task_gains(k,d)
+                    self.cfg['panel_cartesian_stiffness'],self.cfg['panel_cartesian_damping']=k.tolist(),d.tolist()
+                    self.parameter_revision+=1
                 elif op == "arm":
                     owner, _ = self.store.lease()
                     if owner is not None and owner != message["client_id"]:
@@ -462,7 +557,12 @@ class PanelEngine:
                     if blockers:
                         raise ValueError("尚不能启动："+"；".join(blockers))
                     self.observer._waist_current(now_ns, ros_now_ns)
-                    candidate = JointPanelControl(self.model, self.cfg)
+                    if self.selected_control_mode=='cartesian':
+                        if self.backend=='robot' and not self.cfg.get('panel_cartesian_robot_enabled',False):
+                            raise ValueError('笛卡尔阻抗尚未启用实机')
+                        candidate = CartesianPanelControl(self.model,self.cfg,self.flange_config['wrist_from_sensor'])
+                    else:
+                        candidate = JointPanelControl(self.model, self.cfg)
                     candidate.feedback(self.sample, self.gravity)
                     candidate.arm(now_ns, ros_now_ns)
                     # Validate the full candidate before touching SDK transport.
@@ -490,12 +590,29 @@ class PanelEngine:
                     if self.control is None:
                         raise ValueError("请先启动控制")
                     self.control.target(message["q_rad"])
+                elif op == 'cartesian_targets':
+                    if self.control is None or self.control.mode!='cartesian':raise ValueError('请先启动笛卡尔阻抗控制')
+                    reference=f'{self.control.started_ns}:{self.control.reference_generation}'
+                    if 'reference' in message and message['reference']!=reference:
+                        raise ValueError('末端参考已更新，请使用当前位姿目标')
+                    self.control.target_offsets(message.get('offsets'))
+                elif op == 'cartesian_rebase':
+                    if self.control is None or self.control.mode!='cartesian' or self.control.state!='armed':
+                        raise ValueError('请先启动笛卡尔控制')
+                    if self.control.drag_enabled:raise ValueError('请先关闭双臂拖拽')
+                    # Re-arm the same owner from the newest measured pose and
+                    # torque, restarting the existing smooth handoff ramp.
+                    self.control.arm(now_ns,ros_now_ns)
+                elif op == 'drag_mode':
+                    if self.control is None or self.control.mode!='cartesian':
+                        raise ValueError('请先启动笛卡尔控制')
+                    self.control.set_drag(message.get('enabled'),now_ns,ros_now_ns)
                 elif op == "hold":
                     if self.control is not None:
                         self.control.hold()
                     self.store.set_owner(None, now_ns)
                 if op!='gripper_target':self.action_error = None
-            except (ValueError, RuntimeError) as error:
+            except (ValueError, RuntimeError, TypeError) as error:
                 if message['op']=='gripper_target':self.gripper_error=str(error)
                 else:self.action_error = str(error)
         if self.refresh_clocks is not None:
@@ -510,7 +627,7 @@ class PanelEngine:
                 try:
                     if self.base_monitor is not None:
                         base=self.base_monitor.status(now_ns,ros_now_ns)
-                        if not base["ready"]:
+                        if not base["tracking_valid"]:
                             raise ValueError(base["reason"])
                         # Refresh gravity at the latest IMU pose before output,
                         # while keeping the original measured torque sample.
@@ -544,12 +661,17 @@ class PanelEngine:
                 self.static_startup_checks.append((flag,label,self.cfg.get(flag) is True))
         checks=list(self.static_startup_checks)
         if self.base_monitor is not None:
-            checks.append(("base_imu", "胯部 IMU 有效且骨盆接近静止", self.base_monitor.status(now_ns,ros_now_ns)["ready"]))
+            base=self.base_monitor.status(now_ns,ros_now_ns)
+            running=self.control is not None and self.control.state=='armed'
+            label=("胯部 IMU 有效（运动阈值不拦截）" if not base['motion_guard_enabled'] else
+                   "胯部 IMU 有效（运行监测）" if running else "胯部 IMU 有效且骨盆接近静止")
+            checks.append(("base_imu", label,
+                           base['tracking_valid'] if running else base['ready']))
         checks.extend([
             ("feedback", "关节反馈有效且新鲜", sample is not None and
              fresh(sample.source_ns, sample.received_ns, min(self.cfg["feedback_timeout_s"], self.cfg["source_max_age_s"])) and self.error is None),
             ("waist", "腰部消息有效且新鲜", waist["valid"] and waist["fresh"]),
-            ("waist_stationary", "腰部运动满足当前模型限制", waist["stationary"]),
+            ("waist_stationary", "腰部运动满足当前模型限制" if self.waist_motion_guard_enabled else "腰部有效（运动阈值不拦截）", waist["stationary"]),
             ("limits", "关节角可接管（小幅越界仅允许回收）" if np.any(recovery_margins(self.cfg)) else "实际关节角位于控制范围",
              sample is not None and admissible_start(self.model,self.cfg,sample.q)),
             ("publisher", "控制通道可用且无其他指令发布器", self.arm_blocked is None)])
@@ -572,6 +694,9 @@ class PanelEngine:
         if base is not None and not base["ready"]:
             quality["physical_assumptions_confirmed"]=False
             quality["reasons"].append("base_imu_not_ready")
+        if base is not None and base.get('motion_warnings'):
+            quality['physical_assumptions_confirmed']=False
+            quality['reasons'].append('base_motion_estimate_diagnostic_only')
         if not self.waist_status(now_ns,ros_now_ns)["stationary"]:
             quality["physical_assumptions_confirmed"]=False
             quality["reasons"].append("waist_not_stationary")
@@ -581,7 +706,29 @@ class PanelEngine:
         slider_lower=self.model.lower if reference is None else np.where(margin>0,np.minimum(self.model.lower,reference),self.model.lower)
         slider_upper=self.model.upper if reference is None else np.where(margin>0,np.maximum(self.model.upper,reference),self.model.upper)
         return dict(instance_id=self.store.instance_id, backend=self.backend, mode=self.mode,
+                    cartesian_pose=flange_pose_snapshot(self.model,self.pose_sample,
+                        self.flange_config['wrist_from_sensor'],now_ns,ros_now_ns,
+                        min(self.cfg['feedback_timeout_s'],self.cfg['source_max_age_s']),self.pose_error,
+                        control.goal_poses if control is not None and control.mode=='cartesian' and not control.drag_enabled else None),
+                    selected_control_mode=self.selected_control_mode,
+                    active_control_mode=None if control is None else control.mode,
+                    parameter_revision=self.parameter_revision,
+                    joint_gains=dict(kp_target=self.cfg['panel_joint_kp'],kd_target=self.cfg['panel_joint_kd'],
+                        kp_actual=None if control is None else control.kp.tolist(),
+                        kd_actual=None if control is None else control.kd.tolist(),
+                        kp_max=repeated(self.cfg.get('panel_joint_kp_max',[200]*7),'kp_max').tolist(),
+                        kd_max=repeated(self.cfg.get('panel_joint_kd_max',[20]*7),'kd_max').tolist()),
+                    cartesian=dict(available=self.backend=='demo' or bool(self.cfg.get('panel_cartesian_robot_enabled',False)),
+                        stiffness=self.cfg['panel_cartesian_stiffness'],damping=self.cfg['panel_cartesian_damping'],
+                        stiffness_max=self.cfg.get('panel_cartesian_stiffness_max',[600,600,600,10,10,10]),
+                        damping_max=self.cfg.get('panel_cartesian_damping_max',[30,30,30,1,1,1]),
+                        offset_limit_m=self.cfg.get('panel_cartesian_offset_limit_m',.03),
+                        rotation_limit_rad=self.cfg.get('panel_cartesian_rotation_limit_rad',float(np.deg2rad(10))),
+                        max_velocity_m_s=self.cfg.get('panel_cartesian_max_velocity_m_s',.01),
+                        max_angular_velocity_rad_s=self.cfg.get('panel_cartesian_max_angular_velocity_rad_s',.05),
+                        live=control.snapshot() if control is not None and control.mode=='cartesian' else None),
                     grippers=self.grippers.status(now_ns,ros_now_ns),gripper_error=self.gripper_error,
+                    gripper_drives={s:dict(v) for s,v in self.gripper_drives.items()},
                     gripper_available=self.gripper_transport is not None and self.control_enabled,
                     gripper_last_targets=dict(self.gripper_last_targets),gripper_commands_sent=self.gripper_commands_sent,
                     gripper_drive=self.cfg.get('panel_gripper_drive',dict(velocity=.2,acceleration=.2,deceleration=.2,effort=.2)),
@@ -636,6 +783,7 @@ class DemoPlant:
         self.tau = engine.model.gravity(self.q)
         self.elapsed = 0.
         self.gripper_openings={'left':.5,'right':.5}
+        self.external_wrench = None  # Optional 2x6 load in torso axes, at the active control point.
 
     def step(self, dt, now_ns, source_ns):
         model = self.engine.model
@@ -646,8 +794,10 @@ class DemoPlant:
             target, target_velocity, kp, kd, extra = p.target, p.velocity, p.kp, p.kd, p.extra
         external = np.zeros(14)
         for i, side in enumerate(("left", "right")):
-            f = np.array([.8*np.sin(self.elapsed*.8+i), .4*np.cos(self.elapsed*.5+i), .5, 0, 0, 0])
-            external[i*7:(i+1)*7] = model.jacobian(self.q, side).T @ f
+            f = (np.array([.8*np.sin(self.elapsed*.8+i), .4*np.cos(self.elapsed*.5+i), .5, 0, 0, 0])
+                 if self.external_wrench is None else self.external_wrench[i])
+            point_model = self.engine.control.model if self.engine.control is not None and self.engine.control.mode=='cartesian' else model
+            external[i*7:(i+1)*7] = point_model.jacobian(self.q, side).T @ f
         mass, bias = model.terms(self.q, self.dq)
         # Implicit PD integration avoids explicit damping instability on
         # low-inertia wrist joints. The reported effort is the actual drive
@@ -695,8 +845,7 @@ def run_robot(engine, stop):
             engine.hardware_publisher_created = True
     engine.activate_transport = activate_transport
     engine.refresh_clocks = lambda: (time.monotonic_ns(), node.get_clock().now().nanoseconds)
-    def send_gripper(side,opening,source_ns):
-        drive=engine.cfg.get('panel_gripper_drive',dict(velocity=.2,acceleration=.2,deceleration=.2,effort=.2))
+    def send_gripper(side,opening,source_ns,drive):
         topic='/aima/hal/joint/hand/command'
         own=1 if hand_pub[0] is not None else 0
         if node.count_publishers(topic)>own:raise ValueError('检测到其他夹爪指令发布器')
@@ -769,6 +918,7 @@ def main(argv=None):
     parser.add_argument("--instance-id", default="manual")
     parser.add_argument("--config", type=Path, default=ROOT/"configs/robot.json")
     parser.add_argument("--duration-s", type=float, default=0.)
+    parser.add_argument('--capture-dir',type=Path,default=ROOT/'captures/rgb')
     args = parser.parse_args(argv)
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
     cfg.update(json.loads((ROOT/"configs/joint_panel.json").read_text(encoding="utf-8")))
@@ -781,6 +931,7 @@ def main(argv=None):
                    "control_ownership_confirmed", "effort_feedback_semantics_confirmed")})
         flange["calibration_confirmed"] = True
     store = PanelStore(args.instance_id, args.mode != "observe")
+    if cfg.get('panel_camera_enabled',True):store.camera=CameraWorker(cfg,args.backend,args.capture_dir)
     engine = PanelEngine(cfg, flange, store, backend=args.backend, mode=args.mode)
     store.write(engine.snapshot(time.monotonic_ns(), time.time_ns()))
     server = make_server(store, args.port)
@@ -802,7 +953,7 @@ def main(argv=None):
             run_robot(engine, stop)
         else:
             plant = DemoPlant(engine)
-            engine.gripper_transport=lambda side,opening,source:plant.gripper_openings.__setitem__(side,opening)
+            engine.gripper_transport=lambda side,opening,source,drive:plant.gripper_openings.__setitem__(side,opening)
             last = time.monotonic()
             while not stop.is_set():
                 now = time.monotonic()
@@ -817,6 +968,7 @@ def main(argv=None):
         if timer:
             timer.cancel()
         stop.set()
+        if store.camera is not None:store.camera.close()
         server.shutdown()
         server.server_close()
     return 0

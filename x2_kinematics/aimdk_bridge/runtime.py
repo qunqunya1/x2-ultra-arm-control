@@ -25,10 +25,12 @@ class CommandPlan:
 
 
 class ArmRuntime:
-    def __init__(self, dynamics, config, flange, *, mode="observe"):
+    def __init__(self, dynamics, config, flange, *, mode="observe", waist_motion_guard_enabled=True):
         if mode not in ("observe", "gravity"):
             raise ValueError("Unknown runtime mode")
         self.dynamics, self.config, self.mode = dynamics, dict(config), mode
+        if not isinstance(waist_motion_guard_enabled,bool):raise ValueError('waist_motion_guard_enabled must be boolean')
+        self.waist_motion_guard_enabled=waist_motion_guard_enabled
         for key in ("command_hz", "window_s", "max_sample_gap_s", "source_max_age_s", "feedback_timeout_s",
                     "waist_timeout_s", "gravity_ramp_s", "max_joint_velocity_rad_s", "max_drift_from_start_rad",
                     "max_waist_velocity_rad_s", "max_waist_change_rad", "exit_hold_duration_s"):
@@ -71,9 +73,9 @@ class ArmRuntime:
             if self.waist is not None and source <= self.waist[2]:
                 raise ValueError("nonmonotonic_waist_source_timestamp")
             q, dq, _, _ = ordered_joints(message, WAIST_NAMES)
-            if np.max(np.abs(dq)) > self.config["max_waist_velocity_rad_s"]:
+            if self.waist_motion_guard_enabled and np.max(np.abs(dq)) > self.config["max_waist_velocity_rad_s"]:
                 raise ValueError("waist_moving_arm_only_model_invalid")
-            if self.waist_start is not None and np.max(np.abs(q-self.waist_start)) > self.config["max_waist_change_rad"]:
+            if self.waist_motion_guard_enabled and self.waist_start is not None and np.max(np.abs(q-self.waist_start)) > self.config["max_waist_change_rad"]:
                 raise ValueError("waist_posture_changed_restart_required")
             self.waist = (q, int(received_ns), source)
             lower = self.dynamics.model.lowerPositionLimit[self.dynamics.waist_qi]
