@@ -917,11 +917,12 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--instance-id", default="manual")
     parser.add_argument("--config", type=Path, default=ROOT/"configs/robot.json")
+    parser.add_argument("--panel-config", type=Path, default=ROOT/"configs/joint_panel.json")
     parser.add_argument("--duration-s", type=float, default=0.)
     parser.add_argument('--capture-dir',type=Path,default=ROOT/'captures/rgb')
     args = parser.parse_args(argv)
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
-    cfg.update(json.loads((ROOT/"configs/joint_panel.json").read_text(encoding="utf-8")))
+    cfg.update(json.loads(args.panel_config.read_text(encoding="utf-8")))
     cfg['command_hz']=float(cfg.get('panel_command_hz',50.))
     if not np.isfinite(cfg['command_hz']) or not 1 <= cfg['command_hz'] <= 250:
         raise ValueError('Invalid panel command frequency')

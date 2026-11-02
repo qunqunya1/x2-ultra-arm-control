@@ -12,3 +12,4 @@ reports/
 *.onnx
 *.npz
 *.mp4
+configs/*.local.json

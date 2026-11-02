@@ -1,0 +1,13 @@
+.git
+.venv
+**/__pycache__
+*.pyc
+captures
+reports
+logs
+**/*.local.json
+.env
+*.pt
+*.pth
+*.onnx
+*.mp4

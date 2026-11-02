@@ -2,6 +2,8 @@
 
 更新：2026-11-02。完整使用说明见 [guid.md](guid.md)。
 
+**第一次部署请从 [DEPLOYMENT.md](DEPLOYMENT.md) 开始**：包含Docker/Podman镜像构建、容器创建/复用、独立SDK编译、Conda安装、ROS与DDS配置、只读检查、实机配置、电脑SSH转发、启动和停止命令。配套文件位于 `deploy/jetson/`。
+
 本次同步关节PD、笛卡尔阻抗与拖拽、RGB-D预览和RGB采集、可选YOLO调试，以及腰部运动判断开关。默认 `panel_waist_motion_guard_enabled=false`，保留反馈缺失、过期和非法数据处理。源工程已完成实机接管与预抓取接近，完整双臂连接器抓取尚未成功验证。
 
 适用对象：X2 Ultra、原厂 OmniPicker 及转接件，AimDK 1.1.5 接口。
