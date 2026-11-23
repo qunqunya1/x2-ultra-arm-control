@@ -87,6 +87,12 @@ async function sendCartesian(){
 }
 function numberValue(id){const n=$(id).valueAsNumber;if(!finite(n)||n<0)throw new Error('请填写非负的有限参数');return n;}
 function renderTuning(owner){
+  const body=state.body_zero;
+  const bodyBusy=body?.active&&['capturing','returning_zero'].includes(body.phase);
+  $('body-zero').disabled=!state.control_available||!body?.available||!body?.ready||bodyBusy||!!state.control_owner&&!owner;
+  $('body-hold').disabled=!body?.active||!!state.control_owner&&!owner;
+  const phases={idle:'未启动',capturing:'捕获当前姿态',returning_zero:'正在回零',holding_zero:body?.zero_reached?'已到零位并保持':'零位保持中',holding_current:'保持当前位置',holding_fault:'已转为当前位置保持'};
+  $('body-state').textContent=body?(body.fault||body.feedback_error||phases[body.phase]||body.phase):'等待腰腿反馈';
   const selected=state.selected_control_mode||'joint',cart=selected==='cartesian',settings=state.cartesian;
   const configure=state.control_available&&(!state.control_owner||owner);
   const dragging=!!settings?.live?.drag_enabled;
@@ -165,6 +171,11 @@ function syncDraft() {
   draft.forEach((q,i)=>{ $("joint-"+i).value=deg(q); $("target-"+i).textContent=fmt(deg(q))+"°"; });
 }
 function render() {
+  const stop=state.emergency_stop;
+  const stopping=!!stop?.latched;
+  $('emergency-reset').disabled=!stopping;
+  $('emergency-status').textContent=stopping?(Object.keys(stop.errors||{}).length?'部分通道未切换：'+Object.values(stop.errors).join('；'):stop.commands_sent>0?'已下发纯阻尼，急停锁定中':'已锁定，等待阻尼指令下发'):
+    stop?.damping_groups?.length?'阻尼保持中；需手动重新启动控制':'尚未触发';
   const live=state.connection==="live", owner=ownsControl(), demo=state.backend==="demo",dragging=!!state.cartesian?.live?.drag_enabled;
   renderTuning(owner);
   renderPoses();
@@ -259,9 +270,15 @@ async function poll() {
     const next=await response.json();
     if(state && next.instance_id!==state.instance_id){token=null;draft=null;sequence=0;wasOwner=false;gripperSequence=0;pdDirty=false;cartesianGainsDirty=false;modePending=null;cartesianReference=null;dragPending=null;clearTimeout(cartesianTimer);for(const side of ['left','right']){clearTimeout(gripperTimers[side]);gripperDraft[side]=gripperEffort[side]=null;$("gripper-live-"+side).checked=false;}}
     state=next; lastFetch=Date.now(); render();
+    if(state.emergency_stop?.latched){
+      $('arm').disabled=$('body-zero').disabled=$('body-hold').disabled=true;
+      $('control-mode').disabled=$('apply-pd').disabled=$('apply-cartesian-gains').disabled=true;
+    }
   } catch(e) {
     $("connection").textContent="● 连接已断开"; $("connection").className="pill warn";
     $("arm").disabled=$("hold").disabled=true;
+    $('emergency-status').textContent='连接中断，无法确认急停是否生效';
+    $('emergency-reset').disabled=true;$('body-zero').disabled=$('body-hold').disabled=true;
     clearTimeout(targetTimer);clearTimeout(cartesianTimer);modePending=null;
     $('control-mode').disabled=$('apply-pd').disabled=$('apply-cartesian-gains').disabled=true;
     $('drag-mode').disabled=true;dragPending=null;$('cartesian-rebase').disabled=true;$('pose-status').textContent='连接中断 · 位姿已过期';
@@ -301,4 +318,25 @@ setInterval(()=>{if(ownsControl())command("heartbeat").catch(()=>{});},150);
 document.addEventListener("visibilitychange",()=>{if(document.hidden){clearTimeout(targetTimer);clearTimeout(cartesianTimer);if(ownsControl())command("hold").catch(()=>{});}});
 document.addEventListener('visibilitychange',()=>{if(document.hidden)for(const side of ['left','right']){clearTimeout(gripperTimers[side]);$("gripper-live-"+side).checked=false;}});
 window.addEventListener("pagehide",()=>{if(ownsControl())command("hold").catch(()=>{});});
+$('emergency-stop').addEventListener('click',async()=>{
+  clearTimeout(targetTimer);clearTimeout(cartesianTimer);
+  for(const side of ['left','right']){clearTimeout(gripperTimers[side]);$('gripper-live-'+side).checked=false;}
+  $('arm').disabled=$('body-zero').disabled=true;
+  $('emergency-status').textContent='急停请求发送中，等待后端确认';
+  try{
+    if(!token)token=(await(await fetch('/api/session')).json()).token;
+    await command('emergency_stop');
+    toast('急停已提交，等待阻尼指令回读');
+  }catch(error){$('emergency-status').textContent='急停未确认：'+error.message;toast('无法确认阻尼急停生效');}
+});
+$('emergency-reset').addEventListener('click',async()=>{
+  try{await command('emergency_reset');toast('已请求解除锁定；旧轨迹不会恢复，请手动重新启动');}catch(error){toast(error.message);}
+});
+$('body-zero').addEventListener('click',async()=>{
+  $('body-zero').disabled=true;
+  try{await command('body_zero');toast('已提交腰部和双腿回零，完成后持续保持');}catch(error){toast(error.message);}
+});
+$('body-hold').addEventListener('click',async()=>{
+  try{await command('body_hold');toast('已请求腰腿保持当前位置');}catch(error){toast(error.message);}
+});
 build(); poll();

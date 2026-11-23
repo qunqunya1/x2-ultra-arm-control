@@ -4,7 +4,7 @@ import numpy as np
 
 from ..dual_wrench import JointFeedback
 from ..flange_sensor import VirtualFlangeSensorEstimator
-from .protocol import decode_arm, ordered_joints, stamp_ns, WAIST_NAMES
+from .protocol import decode_arm, ordered_joints, stamp_ns, WAIST_NAMES, ARM_NAMES
 
 
 def repeated(value, label):
@@ -60,6 +60,8 @@ class ArmRuntime:
         self.command_start_ns = self.command_initial_extra = None
         self.output_count = 0
         self.limit_mismatch = False
+        self.velocity_violation_count = 0
+        self.last_velocity_violation = None
 
     def _age(self, source, ros_now, limit):
         age = (int(ros_now)-int(source))*1e-9
@@ -122,6 +124,19 @@ class ArmRuntime:
                 if self.mode == "gravity":
                     raise ValueError("arm_outside_urdf_limits")
             if np.max(np.abs(sample.dq)) > self.config["max_joint_velocity_rad_s"]:
+                # Preserve the raw rejected frame before invalidation discards
+                # observer history. This records evidence; it does not filter
+                # feedback or change the existing stop condition.
+                index = int(np.argmax(np.abs(sample.dq)))
+                self.velocity_violation_count += 1
+                self.last_velocity_violation = dict(
+                    joint_name=ARM_NAMES[index], joint_index=index,
+                    reported_velocity_rad_s=float(sample.dq[index]),
+                    limit_rad_s=float(self.config["max_joint_velocity_rad_s"]),
+                    source_ns=int(sample.source_ns), received_ns=int(sample.received_ns),
+                    q_rad=sample.q.tolist(), reported_dq_rad_s=sample.dq.tolist(),
+                    ordering=sample.ordering,
+                    interpretation="raw SDK velocity field; not position-derived confirmation")
                 raise ValueError("arm_velocity_exceeded")
             if self.q_start is not None and np.max(np.abs(sample.q-self.q_start)) > self.config["max_drift_from_start_rad"]:
                 raise ValueError("arm_drift_from_start_exceeded")

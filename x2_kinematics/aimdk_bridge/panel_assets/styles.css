@@ -13,3 +13,5 @@
 .camera-folder-row{padding:0 20px 16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}.camera-folder-row label{font-size:11px;color:#5a7466;white-space:nowrap}.camera-folder-row input{flex:1;min-width:180px;border:1px solid #dbe4dd;background:#f6f8f6;border-radius:6px;padding:9px 11px;color:#345347;font:inherit;font-size:12px}.camera-folder-row button{padding:8px 12px}#camera-folder-status{width:100%;font-size:10px;line-height:1.7;color:var(--muted)}
 
 .yolo-preview-link{color:var(--green);font-size:12px;text-decoration:none;border:1px solid #bfd6c8;border-radius:7px;padding:9px 12px;background:#f3f8f4;white-space:nowrap}
+
+.emergency-bar{position:sticky;top:0;z-index:100;display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:12px 24px;background:#fff0f0;border-bottom:2px solid #bd1825}.emergency-bar small{flex-basis:100%;color:#6c2730}#emergency-stop{background:#b91324;color:#fff;border:2px solid #8d0614;font-size:20px;font-weight:800;padding:15px 24px;border-radius:10px}#emergency-stop:active{background:#78000c}#emergency-status{color:#9d1422}

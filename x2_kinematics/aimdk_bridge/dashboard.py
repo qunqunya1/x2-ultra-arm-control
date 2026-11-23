@@ -23,6 +23,8 @@ from .runtime import ArmRuntime
 from .base_monitor import StaticBaseImu
 from .gripper import GripperFeedback,build_gripper_command,normalized
 from .camera_stream import CameraWorker
+from .body_panel_control import BodyPanelControl, build_body_command, GROUPS as BODY_GROUPS
+from .damping_stop import NAMES as STOP_NAMES, KD as STOP_KD, damping_plan, group_command
 
 ROOT = Path(__file__).resolve().parents[2]
 ASSETS = Path(__file__).with_name("panel_assets")
@@ -44,6 +46,8 @@ class PanelStore:
         self.updated_ns = time.monotonic_ns()
         self.signals = {}
         self.camera = None
+        self.emergency = threading.Event()
+        self.emergency_generation=0
 
     def note_signal(self, key, value):
         with self.lock:
@@ -159,13 +163,27 @@ class PanelStore:
         if not self.control_available:
             raise ValueError("当前为只读模式，滑块目标不会下发")
         op, client = message.get("op"), message.get("client_id")
+        if op=='emergency_stop':
+            if not isinstance(client,str) or not 1<=len(client)<=80:raise ValueError('Invalid client')
+            with self.lock:
+                self.emergency_generation+=1
+                self.emergency.set()
+                self.pending.clear()
+                self.owner=None
+            return
+        if self.emergency.is_set() and op!='emergency_reset':
+            raise ValueError('阻尼急停已锁定，请先解除急停后重新启动')
         if op == "start_control":
             op = "arm"
             message = dict(message, op=op)
-        setup_ops = ("arm", "gripper_target", "joint_gains", "cartesian_gains", "control_mode")
+        setup_ops = ("arm", "gripper_target", "joint_gains", "cartesian_gains", "control_mode", "body_zero", "body_hold", "emergency_reset")
         if op not in (*setup_ops, "targets", "cartesian_targets", "cartesian_rebase", "drag_mode", "heartbeat", "hold") or not isinstance(client, str) or not 1 <= len(client) <= 80:
             raise ValueError("Invalid command")
         with self.lock:
+            if self.emergency.is_set() and op!='emergency_reset':raise ValueError('阻尼急停已锁定')
+            if op=='emergency_reset':
+                if not self.emergency.is_set():raise ValueError('当前没有急停锁定')
+                message=dict(message,emergency_generation=self.emergency_generation)
             if self.owner is not None and self.owner != client:
                 raise ValueError("另一个网页持有控制权")
             if op not in setup_ops and self.owner != client:
@@ -201,6 +219,11 @@ class PanelStore:
             result = list(self.pending)
             self.pending.clear()
             return result
+
+    def reset_emergency(self,generation):
+        with self.lock:
+            if generation!=self.emergency_generation:raise ValueError('存在更新的急停请求，旧解除请求已丢弃')
+            self.emergency.clear()
 
     def set_owner(self, owner, now_ns):
         with self.lock:
@@ -355,6 +378,14 @@ class PanelEngine:
         self.grippers=GripperFeedback()
         self.gripper_transport=None
         self.gripper_error=None
+        self.body = BodyPanelControl()
+        self.body_activate = None
+        self.body_transport = None
+        self.body_timer_driven=False
+        self.damping_groups=set()
+        self.damping_transport=None
+        self.damping_errors={}
+        self.damping_commands=0
         self.gripper_last_targets={}
         self.gripper_commands_sent=0
         self.gripper_hardware_publisher_created=False
@@ -508,6 +539,7 @@ class PanelEngine:
             self.invalid(error)
 
     def step(self, now_ns, ros_now_ns, send):
+        if self.store.emergency.is_set():self._latch_damping(now_ns)
         if self.wrench_worker is not None:
             latest=self.wrench_worker.poll(self.wrench_epoch)
             if latest is not None:
@@ -515,13 +547,25 @@ class PanelEngine:
                 if latest.get('error'):self.failures['async_wrench_reset']+=1
         for message in self.store.drain():
             try:
+                if self.store.emergency.is_set() and message['op']!='emergency_reset':continue
                 if not self.control_enabled:
                     raise ValueError("Observe mode")
                 current_owner,_=self.store.lease()
                 if current_owner is not None and current_owner != message['client_id']:
                     raise ValueError('另一个网页持有控制权')
                 op = message["op"]
-                if op=='gripper_target':
+                if op=='emergency_reset':
+                    self.store.reset_emergency(message.get('emergency_generation'))
+                elif op=='body_zero':
+                    if self.body_activate is None:raise ValueError('腰腿实机接口未连接')
+                    self.body.require(now_ns,ros_now_ns)
+                    self.body_activate()
+                    if self.refresh_clocks is not None:now_ns,ros_now_ns=self.refresh_clocks()
+                    self.body.start(now_ns,ros_now_ns)
+                    self.damping_groups.difference_update(BODY_GROUPS)
+                elif op=='body_hold':
+                    self.body.hold()
+                elif op=='gripper_target':
                     opening=self.grippers.require(message['side'],message['opening'],now_ns,ros_now_ns)
                     if self.gripper_transport is None:raise ValueError('夹爪控制接口尚未就绪')
                     drive=dict(self.gripper_drives[message['side']])
@@ -583,6 +627,7 @@ class PanelEngine:
                         candidate.arm(commit_now,commit_ros)
                         now_ns,ros_now_ns=commit_now,commit_ros
                     self.control = candidate
+                    self.damping_groups.discard('arm')
                     self.observer.waist_start=self.observer.waist[0].copy()
                     self.waist_reference=self.observer.waist[0].copy()
                     self.store.set_owner(message["client_id"], now_ns)
@@ -617,6 +662,12 @@ class PanelEngine:
                 else:self.action_error = str(error)
         if self.refresh_clocks is not None:
             now_ns, ros_now_ns = self.refresh_clocks()
+        if self.store.emergency.is_set():self._latch_damping(now_ns)
+        if self.damping_groups and self.damping_transport is not None:
+            groups=self.damping_groups-set(BODY_GROUPS) if self.body_timer_driven else self.damping_groups
+            if groups:self.damping_transport(groups,ros_now_ns)
+        if self.body_transport is not None and self.body.active and not self.body_timer_driven:
+            self.body_transport(self.body.step(now_ns,ros_now_ns),ros_now_ns)
         if self.control:
             owner, contact = self.store.lease()
             if self.control.state == "armed" and (owner is None or (now_ns-contact)*1e-9 > self.control.timeout):
@@ -648,6 +699,12 @@ class PanelEngine:
             self.store.write(self.snapshot(now_ns, ros_now_ns))
             self.last_snapshot_ns = now_ns
 
+    def _latch_damping(self,now_ns):
+        self.damping_groups.update(STOP_NAMES)
+        self.body.emergency_stop()
+        self.control=None
+        self.store.set_owner(None,now_ns)
+
     def startup_checks(self, now_ns, ros_now_ns):
         sample = self.sample
         waist = self.waist_status(now_ns,ros_now_ns)
@@ -660,6 +717,7 @@ class PanelEngine:
                                ("effort_feedback_semantics_confirmed","关节力矩反馈含义已确认")):
                 self.static_startup_checks.append((flag,label,self.cfg.get(flag) is True))
         checks=list(self.static_startup_checks)
+        checks.append(('emergency_stop','阻尼急停已解除',not self.store.emergency.is_set()))
         if self.base_monitor is not None:
             base=self.base_monitor.status(now_ns,ros_now_ns)
             running=self.control is not None and self.control.state=='armed'
@@ -706,6 +764,10 @@ class PanelEngine:
         slider_lower=self.model.lower if reference is None else np.where(margin>0,np.minimum(self.model.lower,reference),self.model.lower)
         slider_upper=self.model.upper if reference is None else np.where(margin>0,np.maximum(self.model.upper,reference),self.model.upper)
         return dict(instance_id=self.store.instance_id, backend=self.backend, mode=self.mode,
+                    emergency_stop=dict(latched=self.store.emergency.is_set(),damping_groups=sorted(self.damping_groups),
+                        generation=self.store.emergency_generation,
+                        commands_sent=self.damping_commands,errors=dict(self.damping_errors),
+                        kp=0,velocity_target=0,effort_feedforward=0,kd={g:v.tolist() for g,v in STOP_KD.items()}),
                     cartesian_pose=flange_pose_snapshot(self.model,self.pose_sample,
                         self.flange_config['wrist_from_sensor'],now_ns,ros_now_ns,
                         min(self.cfg['feedback_timeout_s'],self.cfg['source_max_age_s']),self.pose_error,
@@ -727,6 +789,7 @@ class PanelEngine:
                         max_velocity_m_s=self.cfg.get('panel_cartesian_max_velocity_m_s',.01),
                         max_angular_velocity_rad_s=self.cfg.get('panel_cartesian_max_angular_velocity_rad_s',.05),
                         live=control.snapshot() if control is not None and control.mode=='cartesian' else None),
+                    body_zero=dict(self.body.snapshot(now_ns,ros_now_ns),available=self.body_activate is not None and self.control_enabled),
                     grippers=self.grippers.status(now_ns,ros_now_ns),gripper_error=self.gripper_error,
                     gripper_drives={s:dict(v) for s,v in self.gripper_drives.items()},
                     gripper_available=self.gripper_transport is not None and self.control_enabled,
@@ -735,6 +798,8 @@ class PanelEngine:
                     gripper_requests_generated=self.gripper_requests_generated,
                     gripper_hardware_publisher_created=self.gripper_hardware_publisher_created,
                     timing=self.timing_cache,command_hz=self.cfg['command_hz'],
+                    velocity_diagnostic=dict(violation_count=self.observer.velocity_violation_count,
+                        last_rejected_frame=self.observer.last_velocity_violation),
                     wrench_worker_alive=None if self.wrench_worker is None else self.wrench_worker.process.is_alive(),
                     connection="live" if age is not None and age <= 100 else "stale" if sample is not None else "waiting",
                     feedback_age_ms=age, wrench_age_ms=force_age,
@@ -756,7 +821,7 @@ class PanelEngine:
                         for i in range(14) if not self.model.lower[i] <= sample.q[i] <= self.model.upper[i]],
                     control_available=self.control_enabled, startup_checks=checks,
                     can_arm=all(check["ok"] for check in checks),
-                    control_state=("idle" if self.control_enabled else "observe") if control is None else control.state,
+                    control_state=('damping' if 'arm' in self.damping_groups else "idle" if self.control_enabled else "observe") if control is None else control.state,
                     control_owner=owner, fault=None if control is None else control.fault,
                     error=self.error or self.action_error, last_request_error=self.action_error, arm_blocked=self.arm_blocked,
                     velocity_limit_rad_s=self.cfg["panel_max_velocity_rad_s"],
@@ -846,6 +911,7 @@ def run_robot(engine, stop):
     engine.activate_transport = activate_transport
     engine.refresh_clocks = lambda: (time.monotonic_ns(), node.get_clock().now().nanoseconds)
     def send_gripper(side,opening,source_ns,drive):
+        if engine.store.emergency.is_set():return
         topic='/aima/hal/joint/hand/command'
         own=1 if hand_pub[0] is not None else 0
         if node.count_publishers(topic)>own:raise ValueError('检测到其他夹爪指令发布器')
@@ -854,15 +920,85 @@ def run_robot(engine, stop):
             engine.gripper_hardware_publisher_created=True
         msg=build_gripper_command(HandCommandArray,HandCommand,HandType,side,opening,node.get_clock().now().nanoseconds,
                                  sequence=engine.gripper_commands_sent,drive=drive)
+        if engine.store.emergency.is_set():return
         hand_pub[0].publish(msg);engine.gripper_commands_sent+=1
     # Type/serialization validation creates message objects only, no publisher.
     build_gripper_command(HandCommandArray,HandCommand,HandType,'left',.5,1,drive=engine.cfg.get('panel_gripper_drive'))
     engine.gripper_transport=send_gripper
+    body_pubs={}
+    body_qos=QoSProfile(depth=10,reliability=ReliabilityPolicy.RELIABLE,durability=DurabilityPolicy.VOLATILE)
+    def activate_body():
+        for group in BODY_GROUPS:
+            topic='/aima/hal/joint/'+group+'/command'
+            if node.count_publishers(topic)>(1 if group in body_pubs else 0):
+                raise ValueError('检测到其他'+group+'关节指令发布器')
+            if node.count_subscribers(topic)<1:raise ValueError(group+'指令接收端未发现')
+        for group in BODY_GROUPS:
+            if group not in body_pubs:
+                body_pubs[group]=node.create_publisher(JointCommandArray,'/aima/hal/joint/'+group+'/command',body_qos)
+    def send_body(plans,source_ns):
+        for group,plan in plans.items():
+            if node.count_publishers('/aima/hal/joint/'+group+'/command')>1:
+                engine.body.hold();engine.body.fault='Body command ownership changed'
+                engine.body.phase='holding_fault'
+                return
+        for group,plan in plans.items():
+            if engine.store.emergency.is_set() or group in engine.damping_groups:
+                plan=damping_plan(group,plan['q'])
+            body_pubs[group].publish(build_body_command(JointCommandArray,JointCommand,group,plan,source_ns,engine.body.commands_sent))
+            engine.body.commands_sent+=1
+    engine.body_activate=activate_body
+    engine.body_transport=send_body
+    head_q=[np.zeros(2)]
+    def head_feedback(msg):
+        try:head_q[0]=np.asarray([j.position for j in ordered_joints(msg,STOP_NAMES['head'])[0]],float)
+        except (ValueError,TypeError,AttributeError):pass
+    node.create_subscription(JointStateArray,'/aima/hal/joint/head/state',head_feedback,qos)
+    head_pub=[None]
+    def send_damping(groups,source_ns):
+        for group in ('waist','leg','arm','head'):
+            if group not in groups:continue
+            try:
+                topic='/aima/hal/joint/'+group+'/command'
+                existing=pub[0] if group=='arm' else head_pub[0] if group=='head' else body_pubs.get(group)
+                if existing is None:
+                    if node.count_publishers(topic)>0:raise ValueError('其他控制器正在发布'+group+'指令')
+                    existing=node.create_publisher(JointCommandArray,topic,body_qos if group in BODY_GROUPS else qos)
+                    if group=='arm':pub[0]=existing;engine.hardware_publisher_created=True
+                    elif group=='head':head_pub[0]=existing
+                    else:body_pubs[group]=existing
+                q=(None if engine.sample is None else engine.sample.q) if group=='arm' else head_q[0] if group=='head' else (
+                    engine.body.samples[group][0][:,0] if group in engine.body.samples else None)
+                existing.publish(group_command(JointCommandArray,JointCommand,group,damping_plan(group,q),
+                    node.get_clock().now().nanoseconds,engine.damping_commands))
+                engine.damping_commands+=1
+                if group=='arm':engine.motor_commands_sent+=1
+                engine.damping_errors.pop(group,None)
+            except (ValueError,RuntimeError) as error:engine.damping_errors[group]=str(error)
+    engine.damping_transport=send_damping
+    engine.body_timer_driven=True
+    def body_tick():
+        now=time.monotonic_ns();ros=node.get_clock().now().nanoseconds
+        if engine.store.emergency.is_set():
+            engine._latch_damping(now)
+            send_damping(set(BODY_GROUPS),ros)
+        elif engine.body.active:
+            send_body(engine.body.step(now,ros),ros)
+        elif set(BODY_GROUPS).intersection(engine.damping_groups):
+            send_damping(set(BODY_GROUPS).intersection(engine.damping_groups),ros)
+    node.create_timer(.01,body_tick)
+    for group in BODY_GROUPS:
+        node.create_subscription(JointStateArray,'/aima/hal/joint/'+group+'/state',
+            lambda m,g=group:engine.body.feedback(g,m,time.monotonic_ns(),node.get_clock().now().nanoseconds),qos)
     hand_qos=QoSProfile(depth=1,reliability=ReliabilityPolicy.BEST_EFFORT,durability=DurabilityPolicy.TRANSIENT_LOCAL)
     node.create_subscription(HandStateArray,'/aima/hal/joint/hand/state',
         lambda m:engine.gripper_feedback(m,time.monotonic_ns(),node.get_clock().now().nanoseconds),hand_qos)
     def send(plan):
         if pub[0] is not None:
+            if engine.store.emergency.is_set() or 'arm' in engine.damping_groups:
+                d=damping_plan('arm',plan.target)
+                from .joint_panel_control import JointPlan
+                plan=JointPlan(d['q'],d['velocity'],d['kp'],d['kd'],d['extra'])
             pub[0].publish(build_command(JointCommandArray, JointCommand, q_target=plan.target,
                 velocity_target=plan.velocity, kp=plan.kp, kd=plan.kd, extra=plan.extra,
                 source_ns=node.get_clock().now().nanoseconds, sequence=engine.sequence))
@@ -892,12 +1028,13 @@ def run_robot(engine, stop):
         while rclpy.ok() and not stop.is_set():
             executor.spin_once(timeout_sec=.002)
     finally:
-        if engine.motor_commands_sent:
+        if engine.motor_commands_sent and engine.control is not None:
             engine.control.hold()
             deadline = time.monotonic()+engine.cfg["exit_hold_duration_s"]
             while rclpy.ok() and time.monotonic() < deadline:
                 send(engine.control.hold_plan())
                 time.sleep(1/engine.cfg["command_hz"])
+        if engine.damping_groups:send_damping(engine.damping_groups,node.get_clock().now().nanoseconds)
         publishers = node.get_publisher_names_and_types_by_node(node.get_name(), node.get_namespace())
         print(diagnostic_json(dict(motor_commands_sent=engine.motor_commands_sent,
             gripper_commands_sent=engine.gripper_commands_sent,
@@ -919,6 +1056,7 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, default=ROOT/"configs/robot.json")
     parser.add_argument("--panel-config", type=Path, default=ROOT/"configs/joint_panel.json")
     parser.add_argument("--duration-s", type=float, default=0.)
+    parser.add_argument('--start-damping-stop',action='store_true',help='Preserve an existing damping-stop latch across a backend update')
     parser.add_argument('--capture-dir',type=Path,default=ROOT/'captures/rgb')
     args = parser.parse_args(argv)
     cfg = json.loads(args.config.read_text(encoding="utf-8"))
@@ -932,6 +1070,8 @@ def main(argv=None):
                    "control_ownership_confirmed", "effort_feedback_semantics_confirmed")})
         flange["calibration_confirmed"] = True
     store = PanelStore(args.instance_id, args.mode != "observe")
+    if args.start_damping_stop:
+        store.emergency.set();store.emergency_generation=1
     if cfg.get('panel_camera_enabled',True):store.camera=CameraWorker(cfg,args.backend,args.capture_dir)
     engine = PanelEngine(cfg, flange, store, backend=args.backend, mode=args.mode)
     store.write(engine.snapshot(time.monotonic_ns(), time.time_ns()))
